@@ -5,8 +5,11 @@
     <TargetFramework>net10.0-windows</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <!-- WinForms is referenced only for Screen.AllScreens (monitor enumeration). -->
+    <!-- WinForms is referenced only for Screen.AllScreens (monitor enumeration);
+         WPF only for the WIC PNG encoder (PngBitmapEncoder), which is ~2x faster
+         than GDI+ and produces smaller files. -->
     <UseWindowsForms>true</UseWindowsForms>
+    <UseWPF>true</UseWPF>
   </PropertyGroup>
 
   <ItemGroup>

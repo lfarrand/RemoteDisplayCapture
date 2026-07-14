@@ -2,10 +2,10 @@ using System.Collections.Concurrent;
 using System.Configuration;
 using System.Diagnostics;
 using System.Drawing;
-using System.Drawing.Imaging;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading.Channels;
-using Vortice.DXGI;
+using System.Windows.Media.Imaging;
 
 namespace PhotoFrameRecorder;
 
@@ -108,31 +108,36 @@ internal static class Program
         var saveQueue = Channel.CreateBounded<(byte[] Buffer, string Path)>(
             new BoundedChannelOptions(SaveQueueCapacity) { FullMode = BoundedChannelFullMode.Wait });
         long saved = 0;
-        int encoderCount = Math.Clamp(Environment.ProcessorCount - 2, 2, 16);
+        int encoderCount = Math.Max(2, Environment.ProcessorCount - 2);
         var encoders = Enumerable.Range(0, encoderCount).Select(_ => Task.Run(async () =>
         {
             await foreach (var (buffer, path) in saveQueue.Reader.ReadAllAsync())
             {
                 try
                 {
-                    var handle = GCHandle.Alloc(buffer, GCHandleType.Pinned);
+                    BitmapSource source;
                     try
                     {
-                        using var bmp = new Bitmap(width, height, width * 4,
-                            PixelFormat.Format32bppRgb, handle.AddrOfPinnedObject());
-                        bmp.Save(path, ImageFormat.Png);
+                        source = BitmapSource.Create(width, height, 96, 96,
+                            System.Windows.Media.PixelFormats.Bgr32, null, buffer, width * 4);
                     }
                     finally
                     {
-                        handle.Free();
+                        // Create copies the pixels, so the buffer can be recycled
+                        // before the (comparatively slow) encode runs.
+                        bufferPool.Add(buffer);
                     }
+
+                    var encoder = new PngBitmapEncoder();
+                    encoder.Frames.Add(BitmapFrame.Create(source));
+                    using var stream = File.Create(path);
+                    encoder.Save(stream);
                     Interlocked.Increment(ref saved);
                 }
                 catch (Exception ex)
                 {
                     Console.Error.WriteLine($"Failed to save {Path.GetFileName(path)}: {ex.Message}");
                 }
-                bufferPool.Add(buffer);
             }
         })).ToArray();
 

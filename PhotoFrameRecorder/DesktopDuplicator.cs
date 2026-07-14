@@ -12,11 +12,19 @@ namespace PhotoFrameRecorder;
 /// </summary>
 internal sealed class DesktopDuplicator : IDisposable
 {
+    // How long to wait for the next present while a frame's GPU copy is still in
+    // flight. The wait doubles as pipelining: the copy completes while we sit in
+    // AcquireNextFrame, so the subsequent Map doesn't stall on the GPU.
+    private const int PipelinePollMs = 4;
+
     private readonly ID3D11Device _device;
     private readonly ID3D11DeviceContext _context;
     private readonly IDXGIOutput1 _output;
-    private readonly ID3D11Texture2D _staging;
+    private readonly ID3D11Texture2D[] _staging;
     private IDXGIOutputDuplication _duplication;
+
+    // Staging slot holding a copied-but-not-yet-read frame, or -1 when empty.
+    private int _pendingSlot = -1;
 
     public int Width { get; }
     public int Height { get; }
@@ -25,7 +33,7 @@ internal sealed class DesktopDuplicator : IDisposable
     public long MissedFrames { get; private set; }
 
     private DesktopDuplicator(ID3D11Device device, ID3D11DeviceContext context,
-        IDXGIOutput1 output, IDXGIOutputDuplication duplication, ID3D11Texture2D staging,
+        IDXGIOutput1 output, IDXGIOutputDuplication duplication, ID3D11Texture2D[] staging,
         int width, int height)
     {
         _device = device;
@@ -92,18 +100,23 @@ internal sealed class DesktopDuplicator : IDisposable
                                   $"({duplication.Description.Rotation}); captures are stored unrotated.");
             }
 
-            ID3D11Texture2D staging = device!.CreateTexture2D(new Texture2DDescription
+            // Two staging textures let the GPU copy frame N while the CPU reads N-1.
+            var staging = new ID3D11Texture2D[2];
+            for (int i = 0; i < staging.Length; i++)
             {
-                Width = (uint)width,
-                Height = (uint)height,
-                MipLevels = 1,
-                ArraySize = 1,
-                Format = Format.B8G8R8A8_UNorm,
-                SampleDescription = new SampleDescription(1, 0),
-                Usage = ResourceUsage.Staging,
-                BindFlags = BindFlags.None,
-                CPUAccessFlags = CpuAccessFlags.Read,
-            });
+                staging[i] = device!.CreateTexture2D(new Texture2DDescription
+                {
+                    Width = (uint)width,
+                    Height = (uint)height,
+                    MipLevels = 1,
+                    ArraySize = 1,
+                    Format = Format.B8G8R8A8_UNorm,
+                    SampleDescription = new SampleDescription(1, 0),
+                    Usage = ResourceUsage.Staging,
+                    BindFlags = BindFlags.None,
+                    CPUAccessFlags = CpuAccessFlags.Read,
+                });
+            }
 
             return new DesktopDuplicator(device!, context!, output1, duplication, staging, width, height);
         }
@@ -121,25 +134,41 @@ internal sealed class DesktopDuplicator : IDisposable
     /// copies it, tightly packed, into <paramref name="buffer"/>. Returns false on
     /// timeout. Pointer-only updates are skipped; duplication access loss (display
     /// mode changes, fullscreen exclusive switches) is recovered automatically.
+    /// Frames flow through a two-slot staging ring so the GPU copy of one frame
+    /// overlaps the CPU readback of the previous one (adds at most
+    /// <see cref="PipelinePollMs"/> latency, which is irrelevant for saving files).
     /// </summary>
     public bool TryAcquireFrame(byte[] buffer, int timeoutMs)
     {
         while (true)
         {
-            Result result = _duplication.AcquireNextFrame((uint)timeoutMs,
+            int wait = _pendingSlot >= 0 ? PipelinePollMs : timeoutMs;
+            Result result = _duplication.AcquireNextFrame((uint)wait,
                 out OutduplFrameInfo info, out IDXGIResource? resource);
 
             if (result == Vortice.DXGI.ResultCode.WaitTimeout)
             {
+                if (_pendingSlot >= 0)
+                {
+                    // No new present within the poll window - drain the frame whose
+                    // GPU copy has been running during the wait.
+                    int ready = _pendingSlot;
+                    _pendingSlot = -1;
+                    ReadStaging(ready, buffer);
+                    return true;
+                }
                 return false;
             }
             if (result == Vortice.DXGI.ResultCode.AccessLost)
             {
+                // The staging ring lives on our device and survives; only the
+                // duplication needs recreating. Any pending frame stays drainable.
                 RecreateDuplication();
                 continue;
             }
             result.CheckError();
 
+            int slot;
             using (resource)
             {
                 // LastPresentTime == 0 means only the mouse pointer changed;
@@ -150,8 +179,9 @@ internal sealed class DesktopDuplicator : IDisposable
                     continue;
                 }
 
+                slot = _pendingSlot < 0 ? 0 : 1 - _pendingSlot;
                 using ID3D11Texture2D texture = resource!.QueryInterface<ID3D11Texture2D>();
-                _context.CopyResource(_staging, texture);
+                _context.CopyResource(_staging[slot], texture);
             }
             _duplication.ReleaseFrame();
 
@@ -160,22 +190,43 @@ internal sealed class DesktopDuplicator : IDisposable
                 MissedFrames += info.AccumulatedFrames - 1;
             }
 
-            MappedSubresource mapped = _context.Map(_staging, 0, MapMode.Read);
-            try
+            if (_pendingSlot >= 0)
             {
-                int tightStride = Width * 4;
+                // Read the older frame while the copy just issued runs on the GPU.
+                int ready = _pendingSlot;
+                _pendingSlot = slot;
+                ReadStaging(ready, buffer);
+                return true;
+            }
+
+            // First frame into an empty pipeline: hold it and poll briefly for the
+            // next present so its GPU copy completes while we wait.
+            _pendingSlot = slot;
+        }
+    }
+
+    private void ReadStaging(int slot, byte[] buffer)
+    {
+        MappedSubresource mapped = _context.Map(_staging[slot], 0, MapMode.Read);
+        try
+        {
+            int tightStride = Width * 4;
+            if ((int)mapped.RowPitch == tightStride)
+            {
+                Marshal.Copy(mapped.DataPointer, buffer, 0, tightStride * Height);
+            }
+            else
+            {
                 nint source = mapped.DataPointer;
                 for (int y = 0; y < Height; y++)
                 {
                     Marshal.Copy(source + y * (nint)mapped.RowPitch, buffer, y * tightStride, tightStride);
                 }
             }
-            finally
-            {
-                _context.Unmap(_staging, 0);
-            }
-
-            return true;
+        }
+        finally
+        {
+            _context.Unmap(_staging[slot], 0);
         }
     }
 
@@ -202,7 +253,10 @@ internal sealed class DesktopDuplicator : IDisposable
     public void Dispose()
     {
         _duplication.Dispose();
-        _staging.Dispose();
+        foreach (var staging in _staging)
+        {
+            staging.Dispose();
+        }
         _output.Dispose();
         _context.Dispose();
         _device.Dispose();
