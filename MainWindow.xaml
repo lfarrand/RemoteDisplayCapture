@@ -1,0 +1,44 @@
+<Window x:Class="PhotoFrameApp.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Photo Frame"
+        WindowStyle="None"
+        WindowStartupLocation="Manual"
+        ResizeMode="NoResize"
+        Background="Black"
+        Cursor="None"
+        UseLayoutRounding="True"
+        KeyDown="Window_KeyDown">
+    <Grid>
+        <!-- Sized in code to exactly (PixelWidth / DpiScale) so one image pixel maps
+             to one screen pixel; NearestNeighbor guards against any resampling. -->
+        <Image x:Name="PhotoImage"
+               Stretch="Fill"
+               HorizontalAlignment="Center"
+               VerticalAlignment="Center"
+               SnapsToDevicePixels="True"
+               RenderOptions.BitmapScalingMode="NearestNeighbor" />
+        <TextBlock x:Name="ErrorText"
+                   Foreground="#FFFF6868"
+                   FontSize="22"
+                   TextWrapping="Wrap"
+                   TextAlignment="Center"
+                   MaxWidth="900"
+                   HorizontalAlignment="Center"
+                   VerticalAlignment="Center"
+                   Visibility="Collapsed" />
+        <TextBlock x:Name="LoadingText"
+                   Foreground="#B0FFFFFF"
+                   FontSize="22"
+                   HorizontalAlignment="Center"
+                   VerticalAlignment="Center"
+                   Visibility="Collapsed" />
+        <TextBlock x:Name="StatusText"
+                   Foreground="#80FFFFFF"
+                   FontSize="16"
+                   Margin="20"
+                   HorizontalAlignment="Left"
+                   VerticalAlignment="Bottom"
+                   Visibility="Collapsed" />
+    </Grid>
+</Window>

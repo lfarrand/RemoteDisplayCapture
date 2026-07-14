@@ -1,0 +1,31 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <!-- WinForms is referenced only for Screen.AllScreens (monitor enumeration). -->
+    <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- WFO0003 suggests the WinForms DPI API, but this app bootstraps through
+         WPF, where the manifest is the supported way to opt into PerMonitorV2. -->
+    <NoWarn>$(NoWarn);WFO0003</NoWarn>
+    <!-- PhotoFrameRecorder is a sibling project nested under this folder;
+         keep its sources out of this project's implicit globs. -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);PhotoFrameRecorder\**</DefaultItemExcludes>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Update="appsettings.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <!-- UseWindowsForms injects implicit usings that collide with WPF's
+       Application/Color/KeyEventArgs; WinForms types are used fully qualified. -->
+  <ItemGroup>
+    <Using Remove="System.Drawing" />
+    <Using Remove="System.Windows.Forms" />
+  </ItemGroup>
+
+</Project>
