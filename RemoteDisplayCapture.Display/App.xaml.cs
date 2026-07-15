@@ -3,7 +3,7 @@ using System.Text.Json;
 using System.Windows;
 using System.Windows.Media;
 
-namespace PhotoFrameApp;
+namespace RemoteDisplayCapture.Display;
 
 public partial class App : Application
 {
@@ -162,20 +162,20 @@ public partial class App : Application
     {
         MessageBox.Show(
             $"{error}\n\n" +
-            "Usage: PhotoFrameApp <image-folder> [frames-per-second] [memory-cap] [once]\n\n" +
+            "Usage: RemoteDisplayCapture.Display <image-folder> [frames-per-second] [memory-cap] [once]\n\n" +
             "Examples:\n" +
-            "  PhotoFrameApp C:\\Photos          (default: 0.5 fps, one image every 2s)\n" +
-            "  PhotoFrameApp C:\\Photos 0.2      (one image every 5s)\n" +
-            "  PhotoFrameApp C:\\Frames 500      (flipbook playback at 500 fps)\n" +
-            "  PhotoFrameApp C:\\Frames 500 8GB  (flipbook with an 8 GB pre-decode cap)\n" +
-            "  PhotoFrameApp C:\\Frames 10 once  (play a single pass, then hold the\n" +
+            "  RemoteDisplayCapture.Display C:\\Photos          (default: 0.5 fps, one image every 2s)\n" +
+            "  RemoteDisplayCapture.Display C:\\Photos 0.2      (one image every 5s)\n" +
+            "  RemoteDisplayCapture.Display C:\\Frames 500      (flipbook playback at 500 fps)\n" +
+            "  RemoteDisplayCapture.Display C:\\Frames 500 8GB  (flipbook with an 8 GB pre-decode cap)\n" +
+            "  RemoteDisplayCapture.Display C:\\Frames 10 once  (play a single pass, then hold the\n" +
             "                                    termination colour from appsettings.json)\n\n" +
             "Images are always shown pixel-perfect at full resolution. The memory cap\n" +
             "(default 2GB) guards flipbook pre-decoding; if the frames need more, the\n" +
             "app tells you the required size instead of shrinking them.\n\n" +
             "The border colour around images smaller than the monitor is set in\n" +
             "appsettings.json next to the executable.",
-            "PhotoFrameApp", MessageBoxButton.OK, MessageBoxImage.Warning);
+            "RemoteDisplayCapture.Display", MessageBoxButton.OK, MessageBoxImage.Warning);
         Shutdown(1);
     }
 }

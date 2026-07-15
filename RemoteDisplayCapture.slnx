@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="RemoteDisplayCapture.Display/RemoteDisplayCapture.Display.csproj" />
+  <Project Path="RemoteDisplayCapture.Recorder/RemoteDisplayCapture.Recorder.csproj" />
+</Solution>

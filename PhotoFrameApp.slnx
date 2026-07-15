@@ -1,4 +1,0 @@
-<Solution>
-  <Project Path="PhotoFrameApp.csproj" />
-  <Project Path="PhotoFrameRecorder/PhotoFrameRecorder.csproj" />
-</Solution>

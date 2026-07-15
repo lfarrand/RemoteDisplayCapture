@@ -15,9 +15,6 @@
     <!-- Flipbook pre-decode allocates heavily across all cores; Server GC
          shortens the wait before playback starts. -->
     <ServerGarbageCollection>true</ServerGarbageCollection>
-    <!-- PhotoFrameRecorder is a sibling project nested under this folder;
-         keep its sources out of this project's implicit globs. -->
-    <DefaultItemExcludes>$(DefaultItemExcludes);PhotoFrameRecorder\**</DefaultItemExcludes>
   </PropertyGroup>
 
   <ItemGroup>

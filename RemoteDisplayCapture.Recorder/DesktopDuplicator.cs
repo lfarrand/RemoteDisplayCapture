@@ -4,7 +4,7 @@ using Vortice.Direct3D;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
 
-namespace PhotoFrameRecorder;
+namespace RemoteDisplayCapture.Recorder;
 
 /// <summary>Pixel encoding of captured frames.</summary>
 internal enum CapturePixelFormat

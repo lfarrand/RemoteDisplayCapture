@@ -2,7 +2,7 @@ using System.IO;
 using System.IO.Compression;
 using System.Runtime.InteropServices;
 
-namespace PhotoFrameRecorder;
+namespace RemoteDisplayCapture.Recorder;
 
 /// <summary>
 /// Minimal TIFF writer for 32-bit float RGBA (scRGB) frames. WPF's

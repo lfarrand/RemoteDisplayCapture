@@ -8,7 +8,7 @@ using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 
-namespace PhotoFrameApp;
+namespace RemoteDisplayCapture.Display;
 
 public partial class MainWindow : Window
 {
@@ -112,7 +112,7 @@ public partial class MainWindow : Window
         if (_imagePaths.Count == 0)
         {
             MessageBox.Show($"No images found in {_folder}",
-                "PhotoFrameApp", MessageBoxButton.OK, MessageBoxImage.Warning);
+                "RemoteDisplayCapture.Display", MessageBoxButton.OK, MessageBoxImage.Warning);
             Close();
             return;
         }
@@ -175,9 +175,9 @@ public partial class MainWindow : Window
                 $"Decoding all {_imagePaths.Count} frames at full resolution needs about " +
                 $"{FormatBytes(estimatedBytes)}, which exceeds the {FormatBytes(_memoryCapBytes)} memory cap.\n\n" +
                 "Images are never shrunk, so either raise the cap, e.g.\n" +
-                $"    PhotoFrameApp \"{_folder}\" {_fps} {Math.Ceiling(estimatedBytes / 1073741824.0)}GB\n" +
+                $"    RemoteDisplayCapture.Display \"{_folder}\" {_fps} {Math.Ceiling(estimatedBytes / 1073741824.0)}GB\n" +
                 "or point the app at a smaller frame set.",
-                "PhotoFrameApp", MessageBoxButton.OK, MessageBoxImage.Warning);
+                "RemoteDisplayCapture.Display", MessageBoxButton.OK, MessageBoxImage.Warning);
             Close();
             return;
         }
@@ -205,7 +205,7 @@ public partial class MainWindow : Window
         if (frames.All(f => f is null) && errors.All(e => e is null))
         {
             MessageBox.Show($"None of the images in {_folder} could be decoded.",
-                "PhotoFrameApp", MessageBoxButton.OK, MessageBoxImage.Warning);
+                "RemoteDisplayCapture.Display", MessageBoxButton.OK, MessageBoxImage.Warning);
             Close();
             return;
         }
@@ -387,7 +387,7 @@ public partial class MainWindow : Window
 
     /// <summary>
     /// End of a single-pass run: stop playback and hold a clean, uniform
-    /// termination-colour screen (the stop signal watched by PhotoFrameRecorder).
+    /// termination-colour screen (the stop signal watched by RemoteDisplayCapture.Recorder).
     /// </summary>
     private void ShowTerminationScreen()
     {

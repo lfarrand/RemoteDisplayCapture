@@ -10,7 +10,7 @@ using System.Windows;
 using System.Windows.Media.Imaging;
 using Vector = System.Numerics.Vector;
 
-namespace PhotoFrameRecorder;
+namespace RemoteDisplayCapture.Recorder;
 
 internal static class Program
 {
@@ -35,7 +35,7 @@ internal static class Program
     {
         if (args.Length < 1)
         {
-            Console.Error.WriteLine("Usage: PhotoFrameRecorder <output-folder>");
+            Console.Error.WriteLine("Usage: RemoteDisplayCapture.Recorder <output-folder>");
             Console.Error.WriteLine();
             Console.Error.WriteLine("Captures every frame the monitor displays (DXGI desktop duplication),");
             Console.Error.WriteLine("saving lossless images named yyyyMMdd-N into <output-folder> in the");
