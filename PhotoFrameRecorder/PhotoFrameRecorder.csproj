@@ -10,6 +10,9 @@
          than GDI+ and produces smaller files. -->
     <UseWindowsForms>true</UseWindowsForms>
     <UseWPF>true</UseWPF>
+    <!-- Parallel encoders allocate on many threads at once; Server GC keeps
+         collections short so the capture loop doesn't miss frames. -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
   </PropertyGroup>
 
   <ItemGroup>

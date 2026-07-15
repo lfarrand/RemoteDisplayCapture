@@ -3,9 +3,12 @@ using System.Configuration;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Numerics;
+using System.Runtime;
 using System.Runtime.InteropServices;
-using System.Threading.Channels;
+using System.Windows;
 using System.Windows.Media.Imaging;
+using Vector = System.Numerics.Vector;
 
 namespace PhotoFrameRecorder;
 
@@ -24,16 +27,19 @@ internal static class Program
     [DllImport("user32.dll")]
     private static extern bool SetProcessDPIAware();
 
-    private static async Task<int> Main(string[] args)
+    private static long s_saved;
+
+    private static int Main(string[] args)
     {
         if (args.Length < 1)
         {
             Console.Error.WriteLine("Usage: PhotoFrameRecorder <output-folder>");
             Console.Error.WriteLine();
             Console.Error.WriteLine("Captures every frame the monitor displays (DXGI desktop duplication),");
-            Console.Error.WriteLine("saving lossless PNGs named yyyyMMdd-N.png into <output-folder>.");
-            Console.Error.WriteLine("Recording stops when the whole screen shows the termination colour");
-            Console.Error.WriteLine("configured in App.config (default #000000), or on Ctrl+C.");
+            Console.Error.WriteLine("saving lossless images named yyyyMMdd-N into <output-folder> in the");
+            Console.Error.WriteLine("format configured in App.config (png, tiff, or bmp). Recording stops");
+            Console.Error.WriteLine("when the whole screen shows the termination colour configured in");
+            Console.Error.WriteLine("App.config (default #000000), or on Ctrl+C.");
             return 1;
         }
 
@@ -41,6 +47,16 @@ internal static class Program
         Directory.CreateDirectory(outputFolder);
 
         Color termination = LoadTerminationColor();
+        int terminationTolerance = LoadTerminationTolerance();
+
+        string? format = LoadOutputFormat();
+        if (format is null)
+        {
+            Console.Error.WriteLine($"OutputFormat '{ConfigurationManager.AppSettings["OutputFormat"]}' " +
+                                    "in App.config is not supported. Lossless formats: png, tiff, bmp.");
+            return 1;
+        }
+        string extension = format == "tiff" ? "tif" : format;
 
         // Keep coordinate spaces honest for the Screen enumeration below.
         // Must run before the first Screen.AllScreens call, which caches its results.
@@ -88,8 +104,9 @@ internal static class Program
         int height = duplicator.Height;
         int frameBytes = width * height * 4;
 
-        Console.WriteLine($"Recording {captureScreen.DeviceName} ({width}x{height}) to {outputFolder}");
-        Console.WriteLine($"Stops when the screen is uniformly {ColorTranslator.ToHtml(termination)}, or on Ctrl+C.");
+        Console.WriteLine($"Recording {captureScreen.DeviceName} ({width}x{height}) to {outputFolder} as .{extension}");
+        Console.WriteLine($"Stops when the screen is uniformly {ColorTranslator.ToHtml(termination)} " +
+                          $"(±{terminationTolerance} per channel), or on Ctrl+C.");
 
         using var cts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) =>
@@ -99,50 +116,39 @@ internal static class Program
         };
 
         // Reuse frame buffers: at refresh rate a 4K stream would otherwise allocate ~2 GB/s.
+        // Pre-warm the pool - committing and zeroing a 33 MB array mid-capture costs
+        // more than a frame interval, which is exactly how startup bursts drop frames.
         var bufferPool = new ConcurrentBag<byte[]>();
+        for (int i = 0; i < 8; i++)
+        {
+            bufferPool.Add(new byte[frameBytes]);
+        }
         byte[] RentBuffer() => bufferPool.TryTake(out var b) ? b : new byte[frameBytes];
 
-        // PNG encoding is far slower than capture, so a bank of parallel encoders
-        // drains a bounded queue. Filenames are assigned at capture time, so
-        // out-of-order encoding cannot reorder the sequence.
-        var saveQueue = Channel.CreateBounded<(byte[] Buffer, string Path)>(
-            new BoundedChannelOptions(SaveQueueCapacity) { FullMode = BoundedChannelFullMode.Wait });
-        long saved = 0;
+        // Encoding is far slower than capture, so a bank of encoder threads drains a
+        // bounded queue. Filenames are assigned at capture time, so out-of-order
+        // encoding cannot reorder the sequence. Workers are dedicated threads (not
+        // thread-pool tasks) because each owns a reusable, thread-affine WriteableBitmap.
+        using var saveQueue = new BlockingCollection<(byte[] Buffer, string Path)>(SaveQueueCapacity);
         int encoderCount = Math.Max(2, Environment.ProcessorCount - 2);
-        var encoders = Enumerable.Range(0, encoderCount).Select(_ => Task.Run(async () =>
+        var encoders = new Thread[encoderCount];
+        for (int i = 0; i < encoderCount; i++)
         {
-            await foreach (var (buffer, path) in saveQueue.Reader.ReadAllAsync())
+            encoders[i] = new Thread(() => EncodeWorker(saveQueue, bufferPool, width, height, format))
             {
-                try
-                {
-                    BitmapSource source;
-                    try
-                    {
-                        source = BitmapSource.Create(width, height, 96, 96,
-                            System.Windows.Media.PixelFormats.Bgr32, null, buffer, width * 4);
-                    }
-                    finally
-                    {
-                        // Create copies the pixels, so the buffer can be recycled
-                        // before the (comparatively slow) encode runs.
-                        bufferPool.Add(buffer);
-                    }
+                IsBackground = true,
+                Name = $"encoder-{i}",
+            };
+            encoders[i].Start();
+        }
 
-                    var encoder = new PngBitmapEncoder();
-                    encoder.Frames.Add(BitmapFrame.Create(source));
-                    using var stream = File.Create(path);
-                    encoder.Save(stream);
-                    Interlocked.Increment(ref saved);
-                }
-                catch (Exception ex)
-                {
-                    Console.Error.WriteLine($"Failed to save {Path.GetFileName(path)}: {ex.Message}");
-                }
-            }
-        })).ToArray();
+        // The capture loop must never be late to AcquireNextFrame: keep it ahead of
+        // the encoder threads in the scheduler and defer blocking GCs while recording.
+        Thread.CurrentThread.Priority = ThreadPriority.AboveNormal;
+        GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;
 
         string date = DateTime.Now.ToString("yyyyMMdd");
-        int sequence = NextSequence(outputFolder, date);
+        int sequence = NextSequence(outputFolder, date, extension);
         long captured = 0;
         bool queueFullWarned = false;
         var statusWatch = Stopwatch.StartNew();
@@ -156,7 +162,7 @@ internal static class Program
             {
                 bufferPool.Add(buffer);
             }
-            else if (IsUniform(buffer, width * height, termination))
+            else if (IsUniform(buffer, width * height, termination, terminationTolerance))
             {
                 bufferPool.Add(buffer);
                 Console.WriteLine("Termination colour detected - stopping.");
@@ -168,29 +174,29 @@ internal static class Program
                 if (today != date)
                 {
                     date = today;
-                    sequence = NextSequence(outputFolder, date);
+                    sequence = NextSequence(outputFolder, date, extension);
                 }
 
-                string path = Path.Combine(outputFolder, $"{date}-{sequence}.png");
+                string path = Path.Combine(outputFolder, $"{date}-{sequence}.{extension}");
                 sequence++;
                 captured++;
 
-                if (!saveQueue.Writer.TryWrite((buffer, path)))
+                if (!saveQueue.TryAdd((buffer, path)))
                 {
                     if (!queueFullWarned)
                     {
                         queueFullWarned = true;
-                        Console.WriteLine("Warning: PNG encoders can't keep up - capture will stall " +
+                        Console.WriteLine("Warning: encoders can't keep up - capture will stall " +
                                           "until the queue drains, and frames may be missed.");
                     }
-                    await saveQueue.Writer.WriteAsync((buffer, path));
+                    saveQueue.Add((buffer, path));
                 }
             }
 
             if (statusWatch.ElapsedMilliseconds >= 1000)
             {
                 statusWatch.Restart();
-                var status = (captured, Volatile.Read(ref saved), duplicator.MissedFrames);
+                var status = (captured, Volatile.Read(ref s_saved), duplicator.MissedFrames);
                 if (status != lastStatus)
                 {
                     lastStatus = status;
@@ -200,32 +206,157 @@ internal static class Program
             }
         }
 
-        saveQueue.Writer.Complete();
-        await Task.WhenAll(encoders);
+        saveQueue.CompleteAdding();
+        foreach (Thread encoder in encoders)
+        {
+            encoder.Join();
+        }
 
-        Console.WriteLine($"Recorder finished: {Volatile.Read(ref saved)} frame(s) saved" +
+        Console.WriteLine($"Recorder finished: {Volatile.Read(ref s_saved)} frame(s) saved" +
                           (duplicator.MissedFrames > 0
                               ? $", {duplicator.MissedFrames} frame(s) missed (see AccumulatedFrames)."
                               : ", no frames missed."));
         return 0;
     }
 
-    /// <summary>
-    /// True when every pixel matches the termination colour (alpha ignored - desktop
-    /// duplication leaves it undefined). SIMD scan via IndexOfAnyExcept.
-    /// </summary>
-    private static bool IsUniform(byte[] buffer, int pixelCount, Color termination)
+    private static void EncodeWorker(BlockingCollection<(byte[] Buffer, string Path)> queue,
+        ConcurrentBag<byte[]> bufferPool, int width, int height, string format)
     {
-        uint rgb = ((uint)termination.R << 16) | ((uint)termination.G << 8) | termination.B;
-        var pixels = MemoryMarshal.Cast<byte, uint>(buffer.AsSpan(0, pixelCount * 4));
-        return pixels.IndexOfAnyExcept(0xFF000000u | rgb, rgb) < 0;
+        // One reusable WIC bitmap per worker: WritePixels overwrites the same native
+        // buffer every frame instead of allocating (and later finalizing) ~33 MB of
+        // fresh WIC memory per frame. WriteableBitmap is thread-affine, which is why
+        // this worker is a dedicated thread.
+        var bitmap = new WriteableBitmap(width, height, 96, 96,
+            System.Windows.Media.PixelFormats.Bgr32, null);
+        var fullFrame = new Int32Rect(0, 0, width, height);
+
+        foreach (var (buffer, path) in queue.GetConsumingEnumerable())
+        {
+            try
+            {
+                bitmap.WritePixels(fullFrame, buffer, width * 4, 0);
+                // The pixels are now in the bitmap; recycle the buffer before the
+                // (comparatively slow) encode runs.
+                bufferPool.Add(buffer);
+
+                BitmapEncoder encoder = CreateEncoder(format);
+                encoder.Frames.Add(BitmapFrame.Create(bitmap));
+                using var stream = new FileStream(path, FileMode.Create, FileAccess.Write,
+                    FileShare.None, 1 << 20);
+                encoder.Save(stream);
+                Interlocked.Increment(ref s_saved);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Failed to save {Path.GetFileName(path)}: {ex.Message}");
+            }
+        }
+    }
+
+    private static BitmapEncoder CreateEncoder(string format) => format switch
+    {
+        "png" => new PngBitmapEncoder(),
+        "tiff" => new TiffBitmapEncoder { Compression = TiffCompressOption.Lzw },
+        "bmp" => new BmpBitmapEncoder(),
+        _ => throw new InvalidOperationException($"unknown format {format}"),
+    };
+
+    /// <summary>
+    /// True when the frame is the termination screen: every pixel uniform (within a
+    /// small epsilon of the frame's own first pixel - HDR tone mapping shifts colours
+    /// but does so uniformly across a solid screen) AND that uniform colour within
+    /// the configured per-channel tolerance of the termination colour. Alpha is
+    /// ignored; desktop duplication leaves it undefined. Tolerance 0 = exact match.
+    /// </summary>
+    private static bool IsUniform(byte[] buffer, int pixelCount, Color termination, int tolerance)
+    {
+        if (tolerance == 0)
+        {
+            uint rgb = ((uint)termination.R << 16) | ((uint)termination.G << 8) | termination.B;
+            var pixels = MemoryMarshal.Cast<byte, uint>(buffer.AsSpan(0, pixelCount * 4));
+            return pixels.IndexOfAnyExcept(0xFF000000u | rgb, rgb) < 0;
+        }
+
+        // The tone-mapped colour must still resemble the configured one.
+        byte b0 = buffer[0], g0 = buffer[1], r0 = buffer[2];
+        if (Math.Abs(r0 - termination.R) > tolerance ||
+            Math.Abs(g0 - termination.G) > tolerance ||
+            Math.Abs(b0 - termination.B) > tolerance)
+        {
+            return false;
+        }
+
+        // The rest of the frame must match the first pixel almost exactly.
+        const int UniformEpsilon = 2;
+        byte bLow = (byte)Math.Max(b0 - UniformEpsilon, 0);
+        byte bHigh = (byte)Math.Min(b0 + UniformEpsilon, 255);
+        byte gLow = (byte)Math.Max(g0 - UniformEpsilon, 0);
+        byte gHigh = (byte)Math.Min(g0 + UniformEpsilon, 255);
+        byte rLow = (byte)Math.Max(r0 - UniformEpsilon, 0);
+        byte rHigh = (byte)Math.Min(r0 + UniformEpsilon, 255);
+
+        // Bounds vectors repeating the BGRA channel pattern (alpha bounds 0..255).
+        int lanes = Vector<byte>.Count;
+        Span<byte> lowPattern = stackalloc byte[lanes];
+        Span<byte> highPattern = stackalloc byte[lanes];
+        for (int lane = 0; lane < lanes; lane++)
+        {
+            (lowPattern[lane], highPattern[lane]) = (lane % 4) switch
+            {
+                0 => (bLow, bHigh),
+                1 => (gLow, gHigh),
+                2 => (rLow, rHigh),
+                _ => ((byte)0, (byte)255),
+            };
+        }
+        var low = new Vector<byte>(lowPattern);
+        var high = new Vector<byte>(highPattern);
+
+        var span = buffer.AsSpan(0, pixelCount * 4);
+        int i = 0;
+        for (; i <= span.Length - lanes; i += lanes)
+        {
+            var v = new Vector<byte>(span.Slice(i, lanes));
+            if (!Vector.EqualsAll(Vector.Max(v, low), v) || !Vector.EqualsAll(Vector.Min(v, high), v))
+            {
+                return false;
+            }
+        }
+        for (; i < span.Length; i += 4)
+        {
+            if (span[i] < bLow || span[i] > bHigh ||
+                span[i + 1] < gLow || span[i + 1] > gHigh ||
+                span[i + 2] < rLow || span[i + 2] > rHigh)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// <summary>Reads TerminationTolerance from App.config, clamped to 0-255; default 30.</summary>
+    private static int LoadTerminationTolerance()
+    {
+        try
+        {
+            string? text = ConfigurationManager.AppSettings["TerminationTolerance"];
+            if (int.TryParse(text, out int value))
+            {
+                return Math.Clamp(value, 0, 255);
+            }
+        }
+        catch (Exception)
+        {
+            // Missing or malformed config - fall back to the default below.
+        }
+        return 30;
     }
 
     /// <summary>Continues today's numbering if the folder already has captures for the date.</summary>
-    private static int NextSequence(string folder, string date)
+    private static int NextSequence(string folder, string date, string extension)
     {
         int max = 0;
-        foreach (string file in Directory.EnumerateFiles(folder, $"{date}-*.png"))
+        foreach (string file in Directory.EnumerateFiles(folder, $"{date}-*.{extension}"))
         {
             string stem = Path.GetFileNameWithoutExtension(file);
             if (int.TryParse(stem.AsSpan(date.Length + 1), out int n) && n > max)
@@ -252,6 +383,28 @@ internal static class Program
             // Missing or malformed config - fall back to the primary screen.
         }
         return 0;
+    }
+
+    /// <summary>Normalized output format from App.config, or null when unsupported.</summary>
+    private static string? LoadOutputFormat()
+    {
+        string? text;
+        try
+        {
+            text = ConfigurationManager.AppSettings["OutputFormat"];
+        }
+        catch (Exception)
+        {
+            text = null;
+        }
+
+        return (text?.Trim().ToLowerInvariant() ?? "png") switch
+        {
+            "png" => "png",
+            "tif" or "tiff" => "tiff",
+            "bmp" => "bmp",
+            _ => null,
+        };
     }
 
     private static Color LoadTerminationColor()

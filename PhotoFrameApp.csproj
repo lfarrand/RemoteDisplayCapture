@@ -12,6 +12,9 @@
     <!-- WFO0003 suggests the WinForms DPI API, but this app bootstraps through
          WPF, where the manifest is the supported way to opt into PerMonitorV2. -->
     <NoWarn>$(NoWarn);WFO0003</NoWarn>
+    <!-- Flipbook pre-decode allocates heavily across all cores; Server GC
+         shortens the wait before playback starts. -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
     <!-- PhotoFrameRecorder is a sibling project nested under this folder;
          keep its sources out of this project's implicit globs. -->
     <DefaultItemExcludes>$(DefaultItemExcludes);PhotoFrameRecorder\**</DefaultItemExcludes>
