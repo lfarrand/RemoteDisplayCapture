@@ -51,12 +51,19 @@ public partial class MainWindow : Window
     // Flipbook mode: all frames pre-decoded at full resolution; the displayed frame is
     // derived from a wall clock so playback stays time-accurate even when the monitor
     // can't show every frame. Oversized frames carry an error message instead of pixels.
+    // How far playback may trail the wall clock before frames are skipped to
+    // catch up. Within this bound every frame is shown (one per render tick);
+    // beyond it - rates above the render tick rate, or a long stall - the
+    // time-accurate index wins.
+    private const long CatchUpFrames = 10;
+
     private BitmapSource?[] _frames = [];
     private string?[] _frameErrors = [];
     private readonly Stopwatch _clock = new();
     private double _clockOffsetSeconds;
     private TimeSpan _lastRenderTime = TimeSpan.MinValue;
     private int _lastShownFrame = -1;
+    private long _lastRawIndex = -1;
 
     public MainWindow(string folder, double fps, long memoryCapBytes, bool playOnce,
         Color borderColor, Color terminationColor, System.Drawing.Rectangle screenBounds)
@@ -258,7 +265,20 @@ public partial class MainWindow : Window
             _lastRenderTime = args.RenderingTime;
         }
 
-        long rawIndex = (long)(CurrentSeconds * _fps);
+        // Pure time-indexing skips frames whenever a render tick lands late across
+        // a frame boundary. Instead, advance one frame per tick (no frame is ever
+        // skipped) unless playback trails the clock by more than CatchUpFrames -
+        // then jump to the time-accurate index. Rates above the render tick rate
+        // stay permanently behind, so they get time-accurate skipping automatically.
+        long timeIndex = (long)(CurrentSeconds * _fps);
+        long rawIndex = Math.Min(timeIndex, _lastRawIndex + 1);
+        if (timeIndex - rawIndex > CatchUpFrames)
+        {
+            rawIndex = timeIndex;
+        }
+        if (rawIndex < 0) rawIndex = 0;
+        _lastRawIndex = rawIndex;
+
         if (_playOnce && rawIndex >= _frames.Length)
         {
             ShowTerminationScreen();
@@ -279,6 +299,8 @@ public partial class MainWindow : Window
     private void RebaseClock(double framePosition)
     {
         _clockOffsetSeconds = framePosition / _fps;
+        // Let the next tick land exactly on framePosition despite the no-skip clamp.
+        _lastRawIndex = (long)framePosition - 1;
         _clock.Reset();
         if (!_paused) _clock.Start();
     }
