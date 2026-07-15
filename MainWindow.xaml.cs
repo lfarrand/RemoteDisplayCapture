@@ -409,13 +409,17 @@ public partial class MainWindow : Window
     {
         try
         {
-            var bitmap = new BitmapImage();
-            bitmap.BeginInit();
-            bitmap.UriSource = new Uri(path);
-            bitmap.CacheOption = BitmapCacheOption.OnLoad;
-            bitmap.EndInit();
-            bitmap.Freeze(); // allow use on the UI thread
-            return bitmap;
+            // Colour management is on by default: WIC applies an embedded ICC
+            // profile during decode (BitmapCreateOptions.IgnoreColorProfile is the
+            // opt-out), so tagged wide-gamut photos arrive correctly converted to
+            // sRGB and untagged images arrive byte-exact. Do NOT add another
+            // ColorConvertedBitmap on top — it double-converts.
+            using var stream = File.OpenRead(path);
+            var decoder = BitmapDecoder.Create(stream,
+                BitmapCreateOptions.None, BitmapCacheOption.OnLoad);
+            BitmapSource frame = decoder.Frames[0];
+            frame.Freeze(); // allow use on the UI thread
+            return frame;
         }
         catch (Exception)
         {

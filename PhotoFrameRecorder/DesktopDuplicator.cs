@@ -6,9 +6,24 @@ using Vortice.DXGI;
 
 namespace PhotoFrameRecorder;
 
+/// <summary>Pixel encoding of captured frames.</summary>
+internal enum CapturePixelFormat
+{
+    /// <summary>8-bit BGRA (standard SDR capture).</summary>
+    Bgra8,
+
+    /// <summary>16-bit float RGBA, linear scRGB.</summary>
+    Fp16,
+
+    /// <summary>10-bit RGB + 2-bit alpha, PQ-encoded BT.2020.</summary>
+    Pq10,
+}
+
 /// <summary>
 /// Wraps DXGI desktop duplication for one monitor: hands over each frame the
-/// compositor presents, exactly once, as tightly-packed 32bpp BGRA pixels.
+/// compositor presents, exactly once, as tightly-packed pixels. Standard mode
+/// yields 8-bit BGRA; HDR mode yields whichever HDR format the compositor uses
+/// (FP16 scRGB or 10-bit PQ/BT.2020).
 /// </summary>
 internal sealed class DesktopDuplicator : IDisposable
 {
@@ -29,12 +44,20 @@ internal sealed class DesktopDuplicator : IDisposable
     public int Width { get; }
     public int Height { get; }
 
+    public CapturePixelFormat PixelFormat { get; }
+
+    public int BytesPerPixel => PixelFormat == CapturePixelFormat.Fp16 ? 8 : 4;
+
+    /// <summary>Set when the output is not composed in plain sRGB, so 8-bit captures
+    /// will be tone-mapped rather than colour-exact.</summary>
+    public string? ColorSpaceNote { get; private init; }
+
     /// <summary>Frames the compositor presented while we weren't ready to receive them.</summary>
     public long MissedFrames { get; private set; }
 
     private DesktopDuplicator(ID3D11Device device, ID3D11DeviceContext context,
         IDXGIOutput1 output, IDXGIOutputDuplication duplication, ID3D11Texture2D[] staging,
-        int width, int height)
+        int width, int height, CapturePixelFormat pixelFormat)
     {
         _device = device;
         _context = context;
@@ -43,9 +66,10 @@ internal sealed class DesktopDuplicator : IDisposable
         _staging = staging;
         Width = width;
         Height = height;
+        PixelFormat = pixelFormat;
     }
 
-    public static DesktopDuplicator Create(string deviceName)
+    public static DesktopDuplicator Create(string deviceName, bool hdr)
     {
         using IDXGIFactory1 factory = DXGI.CreateDXGIFactory1<IDXGIFactory1>();
 
@@ -65,7 +89,7 @@ internal sealed class DesktopDuplicator : IDisposable
 
                 try
                 {
-                    return CreateForOutput(adapter, output);
+                    return CreateForOutput(adapter, output, hdr);
                 }
                 finally
                 {
@@ -79,7 +103,7 @@ internal sealed class DesktopDuplicator : IDisposable
         throw new InvalidOperationException($"no DXGI output is named {deviceName}.");
     }
 
-    private static DesktopDuplicator CreateForOutput(IDXGIAdapter1 adapter, IDXGIOutput output)
+    private static DesktopDuplicator CreateForOutput(IDXGIAdapter1 adapter, IDXGIOutput output, bool hdr)
     {
         // The device must live on the adapter that owns the output being duplicated.
         D3D11.D3D11CreateDevice(adapter, DriverType.Unknown, DeviceCreationFlags.BgraSupport,
@@ -88,7 +112,27 @@ internal sealed class DesktopDuplicator : IDisposable
         IDXGIOutput1 output1 = output.QueryInterface<IDXGIOutput1>();
         try
         {
-            IDXGIOutputDuplication duplication = output1.DuplicateOutput(device!);
+            IDXGIOutputDuplication duplication;
+            CapturePixelFormat pixelFormat;
+            if (hdr)
+            {
+                duplication = DuplicateHdr(output, device!);
+                pixelFormat = duplication.Description.ModeDescription.Format switch
+                {
+                    Format.R16G16B16A16_Float => CapturePixelFormat.Fp16,
+                    Format.R10G10B10A2_UNorm => CapturePixelFormat.Pq10,
+                    Format.B8G8R8A8_UNorm => throw new InvalidOperationException(
+                        "the desktop is not composed in an HDR format - enable HDR on " +
+                        "this screen, or set HdrCapture=false."),
+                    var other => throw new InvalidOperationException(
+                        $"unexpected HDR duplication format {other}."),
+                };
+            }
+            else
+            {
+                duplication = output1.DuplicateOutput(device!);
+                pixelFormat = CapturePixelFormat.Bgra8;
+            }
 
             var mode = duplication.Description.ModeDescription;
             int width = (int)mode.Width;
@@ -101,6 +145,9 @@ internal sealed class DesktopDuplicator : IDisposable
             }
 
             // Two staging textures let the GPU copy frame N while the CPU reads N-1.
+            Format stagingFormat = hdr
+                ? duplication.Description.ModeDescription.Format
+                : Format.B8G8R8A8_UNorm;
             var staging = new ID3D11Texture2D[2];
             for (int i = 0; i < staging.Length; i++)
             {
@@ -110,7 +157,7 @@ internal sealed class DesktopDuplicator : IDisposable
                     Height = (uint)height,
                     MipLevels = 1,
                     ArraySize = 1,
-                    Format = Format.B8G8R8A8_UNorm,
+                    Format = stagingFormat,
                     SampleDescription = new SampleDescription(1, 0),
                     Usage = ResourceUsage.Staging,
                     BindFlags = BindFlags.None,
@@ -118,7 +165,11 @@ internal sealed class DesktopDuplicator : IDisposable
                 });
             }
 
-            return new DesktopDuplicator(device!, context!, output1, duplication, staging, width, height);
+            return new DesktopDuplicator(device!, context!, output1, duplication, staging,
+                width, height, pixelFormat)
+            {
+                ColorSpaceNote = hdr ? null : DescribeNonSrgbColorSpace(output),
+            };
         }
         catch
         {
@@ -127,6 +178,90 @@ internal sealed class DesktopDuplicator : IDisposable
             device?.Dispose();
             throw;
         }
+    }
+
+    /// <summary>
+    /// Duplicates the output in its native HDR format: FP16 scRGB or 10-bit
+    /// PQ/BT.2020, whichever the compositor uses for this screen.
+    /// </summary>
+    private static IDXGIOutputDuplication DuplicateHdr(IDXGIOutput output, ID3D11Device device)
+    {
+        IDXGIOutput5 output5;
+        try
+        {
+            output5 = output.QueryInterface<IDXGIOutput5>();
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException(
+                "HDR capture needs IDXGIOutput5 (Windows 10 1703 or later).", ex);
+        }
+        using (output5)
+        {
+            try
+            {
+                // The list tells DXGI which formats we can consume; it must always
+                // include the 8-bit SDR format, and DXGI picks whichever matches the
+                // desktop's actual composition. The caller checks what came back.
+                return DuplicateOutput1Raw(output5, device,
+                    [Format.R16G16B16A16_Float, Format.R10G10B10A2_UNorm, Format.B8G8R8A8_UNorm]);
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException(
+                    "DuplicateOutput1 failed - HDR capture needs Windows 10 1703 or later.", ex);
+            }
+        }
+    }
+
+    /// <summary>
+    /// IDXGIOutput5::DuplicateOutput1 via the raw COM vtable (slot 26), passing the
+    /// documented native signature exactly.
+    /// </summary>
+    private static unsafe IDXGIOutputDuplication DuplicateOutput1Raw(
+        IDXGIOutput5 output5, ID3D11Device device, Format[] formats)
+    {
+        nint self = output5.NativePointer;
+        nint* vtbl = *(nint**)self;
+        var call = (delegate* unmanaged[Stdcall]<nint, nint, uint, uint, Format*, nint*, int>)vtbl[26];
+
+        nint duplication = 0;
+        int hr;
+        fixed (Format* formatsPtr = formats)
+        {
+            hr = call(self, device.NativePointer, 0u, (uint)formats.Length, formatsPtr, &duplication);
+        }
+        if (hr < 0)
+        {
+            throw new SharpGenException(new Result(hr));
+        }
+        return new IDXGIOutputDuplication(duplication);
+    }
+
+    /// <summary>
+    /// A human-readable warning when the output composes in a colour space other
+    /// than plain sRGB (HDR or auto colour management), where 8-bit captures are
+    /// tone-mapped by Windows and therefore not colour-exact.
+    /// </summary>
+    private static string? DescribeNonSrgbColorSpace(IDXGIOutput output)
+    {
+        try
+        {
+            using IDXGIOutput6 output6 = output.QueryInterface<IDXGIOutput6>();
+            ColorSpaceType colorSpace = output6.Description1.ColorSpace;
+            if (colorSpace != ColorSpaceType.RgbFullG22NoneP709)
+            {
+                return $"Note: {output.Description.DeviceName} is composed in {colorSpace}, " +
+                       "not plain sRGB - 8-bit captures will be tone-mapped, not colour-exact. " +
+                       "Use an SDR-composed screen for exact colours, or set HdrCapture=true " +
+                       "to record the HDR composition itself.";
+            }
+        }
+        catch (Exception)
+        {
+            // IDXGIOutput6 unavailable (pre-1803 Windows) - no way to check, stay quiet.
+        }
+        return null;
     }
 
     /// <summary>
@@ -210,7 +345,7 @@ internal sealed class DesktopDuplicator : IDisposable
         MappedSubresource mapped = _context.Map(_staging[slot], 0, MapMode.Read);
         try
         {
-            int tightStride = Width * 4;
+            int tightStride = Width * BytesPerPixel;
             if ((int)mapped.RowPitch == tightStride)
             {
                 Marshal.Copy(mapped.DataPointer, buffer, 0, tightStride * Height);
@@ -240,7 +375,27 @@ internal sealed class DesktopDuplicator : IDisposable
             Thread.Sleep(100);
             try
             {
-                _duplication = _output.DuplicateOutput(_device);
+                if (PixelFormat == CapturePixelFormat.Bgra8)
+                {
+                    _duplication = _output.DuplicateOutput(_device);
+                }
+                else
+                {
+                    _duplication = DuplicateHdr(_output, _device);
+                    // The staging ring and downstream buffers are sized for the
+                    // original format; an HDR toggle mid-recording must fail loudly
+                    // rather than silently change the pixel encoding.
+                    var format = _duplication.Description.ModeDescription.Format;
+                    var expected = PixelFormat == CapturePixelFormat.Fp16
+                        ? Format.R16G16B16A16_Float
+                        : Format.R10G10B10A2_UNorm;
+                    if (format != expected)
+                    {
+                        throw new InvalidOperationException(
+                            $"desktop pixel format changed from {expected} to {format} " +
+                            "(HDR toggled?) - restart the recorder.");
+                    }
+                }
                 return;
             }
             catch (Exception) when (attempt < 50)

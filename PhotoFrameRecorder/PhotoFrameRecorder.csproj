@@ -13,6 +13,12 @@
     <!-- Parallel encoders allocate on many threads at once; Server GC keeps
          collections short so the capture loop doesn't miss frames. -->
     <ServerGarbageCollection>true</ServerGarbageCollection>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- Manifest-declared DPI awareness is required by DuplicateOutput1; the
+         WinForms analyzer's preferred API is not sufficient for that check. -->
+    <NoWarn>$(NoWarn);WFO0003</NoWarn>
+    <!-- Raw COM vtable call in DesktopDuplicator.DuplicateHdr. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
   <ItemGroup>
